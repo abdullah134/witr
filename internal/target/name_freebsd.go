@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build freebsd
 
 package target
 
@@ -11,8 +11,8 @@ import (
 	"strings"
 )
 
-// isValidServiceLabel validates that a launchd service label contains only
-// safe characters to prevent command injection. Valid labels contain only
+// isValidServiceLabel validates that a service name contains only
+// safe characters to prevent command injection. Valid names contain only
 // alphanumeric characters, dots, hyphens, and underscores.
 var validServiceLabelRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
@@ -30,14 +30,20 @@ func ResolveName(name string) ([]int, error) {
 	selfPid := os.Getpid()
 	parentPid := os.Getppid()
 
-	// Use ps to list all processes on macOS
-	// ps -axo pid=,comm=,args=
-	out, err := exec.Command("ps", "-axo", "pid=,comm=,args=").Output()
+	// Use ps to list all processes on FreeBSD
+	// FreeBSD syntax: ps -axww -o pid -o comm -o args
+	out, err := exec.Command("ps", "-axww", "-o", "pid", "-o", "comm", "-o", "args").Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list processes: %w", err)
 	}
 
-	for line := range strings.Lines(string(out)) {
+	lines := strings.Split(string(out), "\n")
+	// Skip header line (first line)
+	for i, line := range lines {
+		if i == 0 {
+			continue // Skip header
+		}
+
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -69,8 +75,8 @@ func ResolveName(name string) ([]int, error) {
 			args = strings.ToLower(strings.Join(fields[2:], " "))
 		}
 
-		// Match against command name
-		if strings.Contains(comm, lowerName) {
+		// Match against command name (exact or substring)
+		if strings.Contains(comm, lowerName) || comm == lowerName {
 			// Exclude grep-like processes
 			if !strings.Contains(comm, "grep") {
 				procPIDs = append(procPIDs, pid)
@@ -81,6 +87,7 @@ func ResolveName(name string) ([]int, error) {
 		// Match against full command line
 		if strings.Contains(args, lowerName) &&
 			!strings.Contains(args, "grep") {
+
 			procPIDs = append(procPIDs, pid)
 		}
 	}
@@ -90,8 +97,8 @@ func ResolveName(name string) ([]int, error) {
 		return nil, fmt.Errorf("no running process or service named %q", name)
 	}
 
-	// Service detection (launchd)
-	servicePID, _ := resolveLaunchdServicePID(name)
+	// Service detection (rc.d)
+	servicePID, _ := resolveRcServicePID(name)
 
 	// Ambiguity: both process and service, but only if there are at least two unique PIDs
 	uniquePIDs := map[int]bool{}
@@ -107,7 +114,7 @@ func ResolveName(name string) ([]int, error) {
 		fmt.Println()
 		// Service entry first
 		if servicePID > 0 {
-			fmt.Printf("[1] PID %d   %s: launchd service   (service)\n", servicePID, name)
+			fmt.Printf("[1] PID %d   %s: rc.d service   (service)\n", servicePID, name)
 		}
 		// Process entries (skip if PID matches servicePID)
 		idx := 2
@@ -141,33 +148,42 @@ func ResolveName(name string) ([]int, error) {
 	return nil, fmt.Errorf("no running process or service named %q", name)
 }
 
-// resolveLaunchdServicePID tries to resolve a launchd service and returns its PID if running.
-func resolveLaunchdServicePID(name string) (int, error) {
+// resolveRcServicePID tries to resolve a FreeBSD rc.d service and returns its PID if running.
+func resolveRcServicePID(name string) (int, error) {
 	// Validate input before using in command
 	if !isValidServiceLabel(name) {
 		return 0, fmt.Errorf("invalid service name %q", name)
 	}
 
-	// Try common launchd service label patterns
-	labels := []string{
-		name,
-		"com.apple." + name,
-		"org." + name,
-		"io." + name,
+	// Check /var/run/<name>.pid
+	pidFile := "/var/run/" + name + ".pid"
+	content, err := os.ReadFile(pidFile)
+	if err == nil {
+		pid, err := strconv.Atoi(strings.TrimSpace(string(content)))
+		if err == nil && pid > 0 {
+			// Verify process exists using ps command
+			out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "pid=").Output()
+			if err == nil && strings.TrimSpace(string(out)) != "" {
+				return pid, nil
+			}
+		}
 	}
 
-	for _, label := range labels {
-		// All labels are derived from validated name, so they're safe
-		// launchctl print system/<label> or gui/<uid>/<label>
-		out, err := exec.Command("launchctl", "print", "system/"+label).Output()
-		if err == nil {
-			// Parse output to find PID
-			// Look for "pid = <number>"
-			for line := range strings.Lines(string(out)) {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "pid = ") {
-					pidStr := strings.TrimPrefix(line, "pid = ")
-					pid, err := strconv.Atoi(strings.TrimSpace(pidStr))
+	// Try service <name> status
+	out, err := exec.Command("service", name, "status").Output()
+	if err == nil {
+		outStr := string(out)
+		// Look for "is running as pid <number>" or "PID: <number>"
+		if strings.Contains(outStr, "is running") {
+			// Extract PID from output
+			if idx := strings.Index(outStr, "pid "); idx != -1 {
+				start := idx + 4
+				end := start
+				for end < len(outStr) && outStr[end] >= '0' && outStr[end] <= '9' {
+					end++
+				}
+				if end > start {
+					pid, err := strconv.Atoi(outStr[start:end])
 					if err == nil && pid > 0 {
 						return pid, nil
 					}

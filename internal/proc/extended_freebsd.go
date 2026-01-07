@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build freebsd
 
 package proc
 
@@ -11,8 +11,8 @@ import (
 	"github.com/pranshuparmar/witr/pkg/model"
 )
 
-// ReadExtendedInfo reads extended process information for verbose output on macOS.
-// It uses `ps` to fetch memory usage and thread counts.
+// ReadExtendedInfo reads extended process information for verbose output on FreeBSD.
+// It uses `ps` to fetch memory usage and thread counts, similar to macOS.
 func ReadExtendedInfo(pid int) (model.MemoryInfo, model.IOStats, []string, int, uint64, []int, int, error) {
 	var memInfo model.MemoryInfo
 	var ioStats model.IOStats
@@ -22,7 +22,7 @@ func ReadExtendedInfo(pid int) (model.MemoryInfo, model.IOStats, []string, int, 
 	var fdCount int
 	var fdLimit uint64
 
-	// 1. Get Memory and Thread info using ps
+	// 1. Get Memory info using ps
 	// rss = resident set size in 1024 byte blocks
 	// vsz = virtual size in 1024 byte blocks
 	cmd := exec.Command("ps", "-o", "rss,vsz", "-p", strconv.Itoa(pid))
@@ -46,9 +46,9 @@ func ReadExtendedInfo(pid int) (model.MemoryInfo, model.IOStats, []string, int, 
 		}
 	}
 
-	// 2. Scan for threads (M flag in ps shows threads, counting lines - header)
-	// ps -M -p PID
-	threadCmd := exec.Command("ps", "-M", "-p", strconv.Itoa(pid))
+	// 2. Count threads using ps -H (threads) check
+	// `ps -H`
+	threadCmd := exec.Command("ps", "-H", "-p", strconv.Itoa(pid))
 	if threadOut, err := threadCmd.Output(); err == nil {
 		lines := strings.Split(strings.TrimSpace(string(threadOut)), "\n")
 		if len(lines) > 1 {
@@ -56,8 +56,7 @@ func ReadExtendedInfo(pid int) (model.MemoryInfo, model.IOStats, []string, int, 
 		}
 	}
 
-	// 3. Get file descriptors using lsof
-	// lsof -p PID
+	// 3. Get file descriptors using lsof (best effort)
 	fdCmd := exec.Command("sh", "-c", fmt.Sprintf("lsof -p %d | wc -l", pid))
 	if fdOut, err := fdCmd.Output(); err == nil {
 		str := strings.TrimSpace(string(fdOut))
@@ -68,8 +67,7 @@ func ReadExtendedInfo(pid int) (model.MemoryInfo, model.IOStats, []string, int, 
 		}
 	}
 
-	// 4. Children resolution
-	// Using pgrep -P PID
+	// 4. Children resolution using pgrep
 	childCmd := exec.Command("pgrep", "-P", strconv.Itoa(pid))
 	if childOut, err := childCmd.Output(); err == nil {
 		lines := strings.Split(strings.TrimSpace(string(childOut)), "\n")
